@@ -18,6 +18,7 @@ clients must be made or how a client should react.
 #include <libssh/server.h>
 #include <libssh/callbacks.h>
 
+#include <poll.h>
 #include <termios.h>
 #include <fcntl.h>
 #ifdef HAVE_LIBUTIL_H
@@ -54,13 +55,12 @@ clients must be made or how a client should react.
 #endif
 
 #define USER "myuser"
-#define PASSWORD "mypassword"
+#define PASS "mypassword"
+#define BUF_SIZE 1048576
+#define SESSION_END (SSH_CLOSED | SSH_CLOSED_ERROR)
 #define SFTP_SERVER_PATH "/usr/lib/sftp-server"
 
-static int authenticated=0;
-static int tries = 0;
 static int error = 0;
-static ssh_channel chan=NULL;
 
 /* A userdata struct for channel. */
 struct channel_data_struct {
@@ -78,6 +78,13 @@ struct channel_data_struct {
     ssh_event event;
     /* Terminal size struct. */
     struct winsize *winsize;
+};
+
+struct session_data_struct {
+    /* Pointer to the channel the session will allocate. */
+    ssh_channel channel;
+    int auth_attempts;
+    int authenticated;
 };
 
 struct winsize wsize = {
@@ -99,25 +106,22 @@ struct channel_data_struct channel_data = {
 };
 
 static int auth_password(ssh_session session, const char *user,
-        const char *password, void *userdata){
-    (void)userdata;
-    printf("Authenticating user %s pwd %s\n",user, password);
-    if(strcmp(user,USER) == 0 && strcmp(password, PASSWORD) == 0){
-        authenticated = 1;
-        printf("Authenticated\n");
+                         const char *pass, void *userdata) {
+    struct session_data_struct *sdata = (struct session_data_struct *) userdata;
+
+    (void) session;
+
+    if (strcmp(user, USER) == 0 && strcmp(pass, PASS) == 0) {
+        sdata->authenticated = 1;
         return SSH_AUTH_SUCCESS;
     }
-    if (tries >= 3){
-        printf("Too many authentication tries\n");
-        ssh_disconnect(session);
-        error = 1;
-        return SSH_AUTH_DENIED;
-    }
-    tries++;
+
+    sdata->auth_attempts++;
     return SSH_AUTH_DENIED;
 }
 
 static int auth_gssapi_mic(ssh_session session, const char *user, const char *principal, void *userdata){
+    struct session_data_struct *sdata = (struct session_data_struct *) userdata;
     ssh_gssapi_creds creds = ssh_gssapi_get_creds(session);
     (void)userdata;
     printf("Authenticating user %s with gssapi principal %s\n",user, principal);
@@ -126,7 +130,7 @@ static int auth_gssapi_mic(ssh_session session, const char *user, const char *pr
     else
         printf("Not received any forwardable creds\n");
     printf("authenticated\n");
-    authenticated = 1;
+    sdata->authenticated++;
     return SSH_AUTH_SUCCESS;
 }
 
@@ -310,6 +314,12 @@ static int shell_request(ssh_session session, ssh_channel channel,
     return SSH_OK;
 }
 
+struct session_data_struct session_data = {
+	.channel = NULL,
+	.auth_attempts = 0,
+	.authenticated = 0
+};
+
 struct ssh_channel_callbacks_struct channel_cb = {
 	.userdata = &channel_data,
 	.channel_pty_request_function = pty_request,
@@ -321,17 +331,40 @@ struct ssh_channel_callbacks_struct channel_cb = {
 };
 
 static ssh_channel new_session_channel(ssh_session session, void *userdata){
-    (void) session;
-    (void) userdata;
-    if(chan != NULL)
-        return NULL;
-    printf("Allocated session channel\n");
-    chan = ssh_channel_new(session);
-    ssh_callbacks_init(&channel_cb);
-    ssh_set_channel_callbacks(chan, &channel_cb);
-    return chan;
+	struct session_data_struct *sdata = (struct session_data_struct *) userdata;
+    sdata->channel = ssh_channel_new(session);
+    return sdata->channel;
 }
 
+static int process_stdout(socket_t fd, int revents, void *userdata) {
+    char buf[BUF_SIZE];
+    int n = -1;
+    ssh_channel channel = (ssh_channel) userdata;
+
+    if (channel != NULL && (revents & POLLIN) != 0) {
+        n = read(fd, buf, BUF_SIZE);
+        if (n > 0) {
+            ssh_channel_write(channel, buf, n);
+        }
+    }
+
+    return n;
+}
+
+static int process_stderr(socket_t fd, int revents, void *userdata) {
+    char buf[BUF_SIZE];
+    int n = -1;
+    ssh_channel channel = (ssh_channel) userdata;
+
+    if (channel != NULL && (revents & POLLIN) != 0) {
+        n = read(fd, buf, BUF_SIZE);
+        if (n > 0) {
+            ssh_channel_write_stderr(channel, buf, n);
+        }
+    }
+
+    return n;
+}
 
 #ifdef HAVE_ARGP_H
 const char *argp_program_version = "libssh server example "
@@ -441,15 +474,14 @@ int main(int argc, char **argv){
     ssh_bind sshbind;
     ssh_event mainloop;
     struct ssh_server_callbacks_struct cb = {
-        .userdata = NULL,
+        .userdata = &session_data,
         .auth_password_function = auth_password,
         .auth_gssapi_mic_function = auth_gssapi_mic,
         .channel_open_request_session_function = new_session_channel
     };
 
-    char buf[2048];
-    int i;
     int r;
+	int rc;
 
     sshbind=ssh_bind_new();
     session=ssh_new();
@@ -478,6 +510,7 @@ int main(int argc, char **argv){
         return 1;
     }
     ssh_callbacks_init(&cb);
+	ssh_callbacks_init(&channel_cb);
     ssh_set_server_callbacks(session, &cb);
 
     if (ssh_handle_key_exchange(session)) {
@@ -488,7 +521,7 @@ int main(int argc, char **argv){
     mainloop = ssh_event_new();
     ssh_event_add_session(mainloop, session);
 
-    while (!(authenticated && chan != NULL)){
+    while (session_data.authenticated == 0 || session_data.channel == NULL){
         if(error)
             break;
         r = ssh_event_dopoll(mainloop, -1);
@@ -498,14 +531,80 @@ int main(int argc, char **argv){
             return 1;
         }
     }
+
+	ssh_set_channel_callbacks(session_data.channel, &channel_cb);
+
     if(error){
         printf("Error, exiting loop\n");
     } else
         printf("Authenticated and got a channel\n");
+    do {
+        /* Poll the main event which takes care of the session, the channel and
+         * even our child process's stdout/stderr (once it's started). */
+        if (ssh_event_dopoll(mainloop, -1) == SSH_ERROR) {
+          ssh_channel_close(session_data.channel);
+        }
+
+        /* If child process's stdout/stderr has been registered with the event,
+         * or the child process hasn't started yet, continue. */
+        if (channel_data.event != NULL || channel_data.pid == 0) {
+            continue;
+        }
+        /* Executed only once, once the child process starts. */
+        channel_data.event = mainloop;
+        /* If stdout valid, add stdout to be monitored by the poll event. */
+        if (channel_data.child_stdout != -1) {
+            if (ssh_event_add_fd(mainloop, channel_data.child_stdout, POLLIN, process_stdout,
+                                 session_data.channel) != SSH_OK) {
+                fprintf(stderr, "Failed to register stdout to poll context\n");
+                ssh_channel_close(session_data.channel);
+            }
+        }
+
+        /* If stderr valid, add stderr to be monitored by the poll event. */
+        if (channel_data.child_stderr != -1){
+            if (ssh_event_add_fd(mainloop, channel_data.child_stderr, POLLIN, process_stderr,
+                                 session_data.channel) != SSH_OK) {
+                fprintf(stderr, "Failed to register stderr to poll context\n");
+                ssh_channel_close(session_data.channel);
+            }
+        }
+    } while(ssh_channel_is_open(session_data.channel) &&
+            (channel_data.pid == 0 || waitpid(channel_data.pid, &rc, WNOHANG) == 0));
+
+    close(channel_data.pty_master);
+    close(channel_data.child_stdin);
+    close(channel_data.child_stdout);
+    close(channel_data.child_stderr);
+
+    /* Remove the descriptors from the polling context, since they are now
+     * closed, they will always trigger during the poll calls. */
+    ssh_event_remove_fd(mainloop, channel_data.child_stdout);
+    ssh_event_remove_fd(mainloop, channel_data.child_stderr);
+
+    /* If the child process exited. */
+    if (kill(channel_data.pid, 0) < 0 && WIFEXITED(rc)) {
+        rc = WEXITSTATUS(rc);
+        ssh_channel_request_send_exit_status(session_data.channel, rc);
+    /* If client terminated the channel or the process did not exit nicely,
+     * but only if something has been forked. */
+    } else if (channel_data.pid > 0) {
+        kill(channel_data.pid, SIGKILL);
+    }
+
+    ssh_channel_send_eof(session_data.channel);
+    ssh_channel_close(session_data.channel);
+
+    /* Wait up to 5 seconds for the client to terminate the session. */
+    for (int n = 0; n < 50 && (ssh_get_status(session) & SESSION_END) == 0; n++) {
+        ssh_event_dopoll(mainloop, 100);
+    }
+
+	/*
     do{
-        i=ssh_channel_read(chan,buf, 2048, 0);
+        i=ssh_channel_read(session_data.channel,buf, 2048, 0);
         if(i>0) {
-            ssh_channel_write(chan, buf, i);
+            ssh_channel_write(session_data.channel, buf, i);
             if (write(1,buf,i) < 0) {
                 printf("error writing to buffer\n");
                 return 1;
@@ -515,13 +614,14 @@ int main(int argc, char **argv){
                     printf("error writing to buffer\n");
                     return 1;
                 }
-                ssh_channel_write(chan, "\n", 1);
+                ssh_channel_write(session_data.channel, "\n", 1);
             }
         }
     } while (i>0);
     ssh_disconnect(session);
     ssh_bind_free(sshbind);
     ssh_finalize();
+	*/
     return 0;
 }
 

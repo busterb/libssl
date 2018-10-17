@@ -61,10 +61,12 @@ static void set_default_keys(ssh_bind sshbind,
         ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_RSAKEY,
                              KEYS_FOLDER "ssh_host_rsa_key");
     }
+	/*
     if (!dsa_already_set) {
         ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_DSAKEY,
                              KEYS_FOLDER "ssh_host_dsa_key");
     }
+	*/
     if (!ecdsa_already_set) {
         ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_ECDSAKEY,
                              KEYS_FOLDER "ssh_host_ecdsa_key");
